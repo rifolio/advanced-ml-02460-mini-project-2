@@ -665,8 +665,8 @@ if __name__ == "__main__":
         for c in range(num_classes):
             mask = y_train == c
             ax.scatter(
-                z_train[mask, 0],
-                z_train[mask, 1],
+                z_train_np[mask, 0],
+                z_train_np[mask, 1],
                 s=10,
                 alpha=0.55,
                 label=f"class {c}",
