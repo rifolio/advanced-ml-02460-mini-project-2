@@ -15,6 +15,7 @@ import json
 import os
 import time
 import matplotlib.pyplot as plt
+import numpy as np
 
 RUN_META_FILENAME = "run_meta.json"
 
@@ -408,6 +409,39 @@ if __name__ == "__main__":
         default=0,
         help="RNG seed for latent pair sampling (default: %(default)s)",
     )
+    parser.add_argument(
+        "--std-grid-size",
+        type=int,
+        default=120,
+        metavar="N",
+        help="resolution of latent grid for std background (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--std-pad",
+        type=float,
+        default=0.5,
+        help="padding around latent cloud for std background grid (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--std-mc-samples",
+        type=int,
+        default=16,
+        metavar="N",
+        help="number of latent perturbation samples per grid point for std map (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--std-latent-noise",
+        type=float,
+        default=0.25,
+        help="std of latent perturbations used for std map (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--std-batch-size",
+        type=int,
+        default=1024,
+        metavar="N",
+        help="number of grid points per forward batch for std map (default: %(default)s)",
+    )
 
     args = parser.parse_args()
     print("# Options")
@@ -629,11 +663,30 @@ if __name__ == "__main__":
         y_train = torch.cat(ys, dim=0).numpy()
 
         num_pairs = args.num_pairs
-        z_pool = torch.randn(num_pairs * 2, M, device=device_t)
+        z_train_t = torch.tensor(z_train, dtype=torch.float32, device=device_t)
+
+        if z_train_t.shape[0] < 2:
+            raise RuntimeError("Need at least 2 encoded points to form geodesic pairs.")
+
+        if z_train_t.shape[0] < 2 * num_pairs:
+            print(
+                f"Warning: requested {num_pairs} disjoint pairs, but only "
+                f"{z_train_t.shape[0]} encoded points are available. Sampling pairs with replacement."
+            )
+            pair_idx = torch.randint(
+                low=0,
+                high=z_train_t.shape[0],
+                size=(num_pairs, 2),
+                device=device_t,
+            )
+        else:
+            perm = torch.randperm(z_train_t.shape[0], device=device_t)
+            pair_idx = perm[: 2 * num_pairs].view(num_pairs, 2)
+
         geodesics_xy = []
         for i in tqdm(range(num_pairs), desc="geodesics"):
-            z0 = z_pool[2 * i]
-            z1 = z_pool[2 * i + 1]
+            z0 = z_train_t[pair_idx[i, 0]]
+            z1 = z_train_t[pair_idx[i, 1]]
             path = optimize_geodesic(
                 model,
                 z0,
@@ -645,18 +698,77 @@ if __name__ == "__main__":
             )
             geodesics_xy.append(path.cpu().numpy())
 
+        zmin = z_train.min(axis=0)
+        zmax = z_train.max(axis=0)
+        x_lo, y_lo = zmin[0] - args.std_pad, zmin[1] - args.std_pad
+        x_hi, y_hi = zmax[0] + args.std_pad, zmax[1] + args.std_pad
+        gx = torch.linspace(x_lo, x_hi, args.std_grid_size, device=device_t)
+        gy = torch.linspace(y_lo, y_hi, args.std_grid_size, device=device_t)
+        mx, my = torch.meshgrid(gx, gy, indexing="xy")
+        grid_z = torch.stack([mx.reshape(-1), my.reshape(-1)], dim=1)
+        with torch.no_grad():
+            std_vals = []
+            for start in range(0, grid_z.shape[0], args.std_batch_size):
+                z_chunk = grid_z[start : start + args.std_batch_size]
+                b = z_chunk.shape[0]
+                eps = torch.randn(
+                    b,
+                    args.std_mc_samples,
+                    M,
+                    device=device_t,
+                ) * args.std_latent_noise
+                z_mc = (z_chunk[:, None, :] + eps).reshape(-1, M)
+                means_mc = model.decoder.decoder_net(z_mc).view(b, args.std_mc_samples, -1)
+                std_chunk = means_mc.std(dim=1, unbiased=False).mean(dim=1)
+                std_vals.append(std_chunk)
+            std_map = torch.cat(std_vals, dim=0)
+            std_map = std_map.view(args.std_grid_size, args.std_grid_size).cpu().numpy()
+            vmin, vmax = np.percentile(std_map, [2.0, 98.0])
+
         fig, ax = plt.subplots(figsize=(8, 8))
+        im = ax.imshow(
+            std_map.T,
+            origin="lower",
+            extent=[x_lo, x_hi, y_lo, y_hi],
+            cmap="viridis",
+            alpha=0.85,
+            aspect="auto",
+            vmin=vmin,
+            vmax=vmax,
+        )
+        cbar = fig.colorbar(im, ax=ax)
+        cbar.set_label("Standard deviation of pixel values")
         for c in range(num_classes):
             mask = y_train == c
             ax.scatter(
                 z_train[mask, 0],
                 z_train[mask, 1],
                 s=10,
-                alpha=0.55,
+                alpha=0.7,
                 label=f"class {c}",
             )
-        for path in geodesics_xy:
-            ax.plot(path[:, 0], path[:, 1], color="0.2", lw=0.85, alpha=0.65)
+        pair_colors = plt.cm.tab20(
+            torch.linspace(0, 1, max(1, len(geodesics_xy))).cpu().numpy()
+        )
+        for i, path in enumerate(geodesics_xy):
+            color = pair_colors[i]
+            ax.plot(
+                path[:, 0],
+                path[:, 1],
+                color=color,
+                lw=0.95,
+                alpha=0.75,
+                label="Pullback geodesic" if i == 0 else None,
+            )
+            ax.plot(
+                [path[0, 0], path[-1, 0]],
+                [path[0, 1], path[-1, 1]],
+                linestyle=":",
+                color=color,
+                lw=1.1,
+                alpha=0.9,
+                label="Straight line" if i == 0 else None,
+            )
         ax.set_aspect("equal", adjustable="box")
         ax.set_xlabel(r"$z_1$")
         ax.set_ylabel(r"$z_2$")
