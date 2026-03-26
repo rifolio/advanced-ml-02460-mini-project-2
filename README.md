@@ -119,6 +119,10 @@ Resume training without overwriting existing checkpoints (default `SKIP_IF_EXIST
 ```bash
 SKIP_IF_EXISTS=1 DEVICE=mps DECODER_SWEEP="2 3" ./scripts/run_partb_experiments.sh train
 ```
+For windows:
+```bash
+PYTHON=python SKIP_IF_EXISTS=1 DEVICE=cpu DECODER_SWEEP="2 3" ./scripts/run_partb_experiments.sh train
+```
 
 **CoV plot** (after all `experiments/partb/d<D>_r<MM>/model.pt` exist; uses shared pairs under `experiments/partb/_shared_pairs` by default):
 
