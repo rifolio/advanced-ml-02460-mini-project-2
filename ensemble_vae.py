@@ -625,8 +625,8 @@ if __name__ == "__main__":
                 q = model.encoder(x)
                 zs.append(q.mean.cpu())
                 ys.append(y)
-        z_train = torch.cat(zs, dim=0).numpy()
-        y_train = torch.cat(ys, dim=0).numpy()
+        z_train = torch.cat(zs, dim=0)
+        y_train = torch.cat(ys, dim=0)
 
         num_pairs = args.num_pairs
         num_points = z_train.shape[0]
@@ -638,11 +638,10 @@ if __name__ == "__main__":
                 raise ValueError("Invalid pair indices shape")
         except (FileNotFoundError, ValueError):
             pair_indices = torch.randint(0, num_points, (num_pairs, 2))
+            for i in range(num_pairs):
+                while pair_indices[i, 0] == pair_indices[i, 1]:
+                    pair_indices[i, 1] = torch.randint(0, num_points, (1,))
             torch.save(pair_indices, os.path.join(args.experiment_folder, "geodesic_pairs.pt"))
-
-        for i in range(num_pairs):
-            while pair_indices[i, 0] == pair_indices[i, 1]:
-                pair_indices[i, 1] = torch.randint(0, num_points, (1,))
 
         geodesics_xy = []
         for i in tqdm(range(num_pairs), desc="geodesics"):
@@ -658,6 +657,9 @@ if __name__ == "__main__":
                 steps=args.geodesic_steps,
             )
             geodesics_xy.append(path.cpu().numpy())
+        
+        z_train_np = z_train.numpy()
+        y_train_np = y_train.numpy()
 
         fig, ax = plt.subplots(figsize=(8, 8))
         for c in range(num_classes):
