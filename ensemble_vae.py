@@ -255,7 +255,7 @@ def pullback_curve_energy(model, z_path):
     return torch.sum((f[1:] - f[:-1]).pow(2))
 
 
-def optimize_geodesic(
+def optimize_geodesic(  
     model,
     z0,
     z1,
@@ -620,7 +620,7 @@ if __name__ == "__main__":
 
         zs, ys = [], []
         with torch.no_grad():
-            for x, y in mnist_train_loader:
+            for x, y in mnist_test_loader:
                 x = x.to(device_t)
                 q = model.encoder(x)
                 zs.append(q.mean.cpu())
@@ -629,11 +629,25 @@ if __name__ == "__main__":
         y_train = torch.cat(ys, dim=0).numpy()
 
         num_pairs = args.num_pairs
-        z_pool = torch.randn(num_pairs * 2, M, device=device_t)
+        num_points = z_train.shape[0]
+
+        try:
+            pair_indices = torch.load(os.path.join(args.experiment_folder, "geodesic_pairs.pt"))
+            if pair_indices.shape != (num_pairs, 2):
+                print(f"Warning: Loaded pair indices shape {pair_indices.shape} does not match expected {(num_pairs, 2)}. Resampling.")
+                raise ValueError("Invalid pair indices shape")
+        except (FileNotFoundError, ValueError):
+            pair_indices = torch.randint(0, num_points, (num_pairs, 2))
+            torch.save(pair_indices, os.path.join(args.experiment_folder, "geodesic_pairs.pt"))
+
+        for i in range(num_pairs):
+            while pair_indices[i, 0] == pair_indices[i, 1]:
+                pair_indices[i, 1] = torch.randint(0, num_points, (1,))
+
         geodesics_xy = []
         for i in tqdm(range(num_pairs), desc="geodesics"):
-            z0 = z_pool[2 * i]
-            z1 = z_pool[2 * i + 1]
+            z0 = z_train[pair_indices[i, 0]].to(device_t)
+            z1 = z_train[pair_indices[i, 1]].to(device_t)  
             path = optimize_geodesic(
                 model,
                 z0,
