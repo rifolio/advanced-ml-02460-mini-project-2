@@ -1,0 +1,12 @@
+{
+  "epochs_per_decoder": 150,
+  "latent_dim": 2,
+  "batch_size": 32,
+  "num_decoders": 2,
+  "rerun_index": 8,
+  "num_reruns": 10,
+  "training_seed": 800024,
+  "experiment_folder": "experiments/partb/d2_r08",
+  "figure_prefix": "d2_r08",
+  "trained_at_unix": 1774540147.598986
+}

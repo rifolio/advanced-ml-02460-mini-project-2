@@ -14,7 +14,9 @@ from tqdm import tqdm
 import json
 import os
 import time
+
 import matplotlib.pyplot as plt
+import numpy as np
 
 RUN_META_FILENAME = "run_meta.json"
 
@@ -42,6 +44,22 @@ def figure_filename(prefix, epochs, kind):
     """kind: samples | reconstruction | geodesics"""
     safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in str(prefix))
     return f"{safe}_e{int(epochs)}_{kind}.png"
+
+
+def migrate_state_dict_to_ensemble(state_dict):
+    """Map legacy single-decoder keys (decoder.*) to decoders.0.* for EnsembleVAE."""
+    if not isinstance(state_dict, dict):
+        return state_dict
+    if any(k.startswith("decoders.") for k in state_dict):
+        return state_dict
+    out = {}
+    for k, v in state_dict.items():
+        if k.startswith("decoder."):
+            out["decoders.0." + k[len("decoder.") :]] = v
+        else:
+            out[k] = v
+    return out
+
 
 class GaussianPrior(nn.Module):
     def __init__(self, M):
@@ -181,6 +199,35 @@ class VAE(nn.Module):
         return -self.elbo(x)
 
 
+class EnsembleVAE(nn.Module):
+    """
+    VAE with multiple decoder networks; each training step uses one decoder
+    drawn uniformly (ensemble training for Part B).
+    """
+
+    def __init__(self, prior, decoders, encoder):
+        super().__init__()
+        self.prior = prior
+        self.decoders = nn.ModuleList(decoders)
+        self.encoder = encoder
+
+    def elbo(self, x):
+        q = self.encoder(x)
+        z = q.rsample()
+        idx = torch.randint(0, len(self.decoders), (1,)).item()
+        dec = self.decoders[idx]
+        return torch.mean(
+            dec(z).log_prob(x) - q.log_prob(z) + self.prior().log_prob(z)
+        )
+
+    def sample(self, n_samples=1):
+        z = self.prior().sample(torch.Size([n_samples]))
+        return self.decoders[0](z).sample()
+
+    def forward(self, x):
+        return -self.elbo(x)
+
+
 def train(model, optimizer, data_loader, epochs, device):
     """
     Train a VAE model.
@@ -233,15 +280,19 @@ def train(model, optimizer, data_loader, epochs, device):
                 break
 
 
-def decoder_mean_flat(model, z):
+def decoder_mean_flat(model, z, decoder_index=0):
     """
     Decoder mean f(z) as a flat vector for pull-back distances in image space.
 
     z: (batch, M) or (M,)
+    decoder_index: which ensemble member (Part A uses 0).
     """
     if z.dim() == 1:
         z = z.unsqueeze(0)
-    means = model.decoder.decoder_net(z)
+    if hasattr(model, "decoders"):
+        means = model.decoders[decoder_index].decoder_net(z)
+    else:
+        means = model.decoder.decoder_net(z)
     return means.view(z.shape[0], -1)
 
 
@@ -253,6 +304,39 @@ def pullback_curve_energy(model, z_path):
     """
     f = decoder_mean_flat(model, z_path)
     return torch.sum((f[1:] - f[:-1]).pow(2))
+
+
+def ensemble_curve_energy(model, z_path, mc_samples=16):
+    """
+    Model-average discrete curve energy (Part B, Eq. 1):
+    sum_i E_{l,k}[ ||f_l(z_i) - f_k(z_{i+1})||^2 ], approximated by Monte Carlo.
+
+    When D=1 this equals pullback_curve_energy (same f_0 at both endpoints of each segment).
+    """
+    if not hasattr(model, "decoders"):
+        return pullback_curve_energy(model, z_path)
+    d_dec = len(model.decoders)
+    if d_dec == 1:
+        return pullback_curve_energy(model, z_path)
+
+    k_seg = z_path.shape[0] - 1
+    if k_seg <= 0:
+        return z_path.sum() * 0.0
+
+    device = z_path.device
+    total = z_path.new_zeros(())
+    for i in range(k_seg):
+        zi = z_path[i : i + 1]
+        zj = z_path[i + 1 : i + 2]
+        seg_sum = z_path.new_zeros(())
+        for _ in range(mc_samples):
+            li = int(torch.randint(0, d_dec, (1,), device=device).item())
+            ki = int(torch.randint(0, d_dec, (1,), device=device).item())
+            fi = decoder_mean_flat(model, zi, li)
+            fj = decoder_mean_flat(model, zj, ki)
+            seg_sum = seg_sum + (fi - fj).pow(2).sum()
+        total = total + seg_sum / float(mc_samples)
+    return total
 
 
 def optimize_geodesic(  
@@ -292,6 +376,228 @@ def optimize_geodesic(
     return z_path
 
 
+def optimize_ensemble_geodesic(
+    model,
+    z0,
+    z1,
+    num_interior,
+    device,
+    lr=0.05,
+    steps=500,
+    mc_samples=16,
+):
+    """
+    Minimize ensemble (model-average) curve energy over interior waypoints; endpoints fixed.
+    """
+    z0 = z0.detach().clone()
+    z1 = z1.detach().clone()
+    if num_interior <= 0:
+        return torch.stack([z0, z1], dim=0)
+
+    ts = torch.linspace(0.0, 1.0, num_interior + 2, device=device)[1:-1]
+    init = torch.stack([(1.0 - t) * z0 + t * z1 for t in ts], dim=0)
+    z_in = nn.Parameter(init.clone())
+    opt = torch.optim.Adam([z_in], lr=lr)
+
+    for _ in range(steps):
+        opt.zero_grad()
+        z_path = torch.cat([z0.unsqueeze(0), z_in, z1.unsqueeze(0)], dim=0)
+        e = ensemble_curve_energy(model, z_path, mc_samples=mc_samples)
+        e.backward()
+        opt.step()
+
+    with torch.no_grad():
+        z_path = torch.cat([z0.unsqueeze(0), z_in.detach(), z1.unsqueeze(0)], dim=0)
+    return z_path
+
+
+def curve_energy_at_path(model, z_path, use_ensemble, mc_samples):
+    """Energy of a fixed polyline (for reporting distance after optimization)."""
+    if use_ensemble:
+        return ensemble_curve_energy(model, z_path, mc_samples=mc_samples)
+    return pullback_curve_energy(model, z_path)
+
+
+def build_ensemble_vae(M, num_decoders, new_encoder_fn, new_decoder_fn, device):
+    """num_decoders >= 1."""
+    prior = GaussianPrior(M)
+    encoder = GaussianEncoder(new_encoder_fn())
+    decoders = [GaussianDecoder(new_decoder_fn()) for _ in range(num_decoders)]
+    return EnsembleVAE(prior, decoders, encoder).to(device)
+
+
+def load_model_weights(model, path, map_location):
+    state = torch.load(path, map_location=map_location)
+    state = migrate_state_dict_to_ensemble(state)
+    model.load_state_dict(state, strict=True)
+
+
+def resolved_training_seed(args):
+    if getattr(args, "training_seed", None) is not None:
+        return args.training_seed
+    return args.seed + args.rerun_index * 100_003
+
+
+def run_cov_mode(
+    args,
+    M,
+    new_encoder,
+    new_decoder,
+    mnist_test_loader,
+):
+    """
+    Part B: CoV of Euclidean vs geodesic distances across M retrained VAEs, per D.
+    """
+    device_t = torch.device(args.device)
+    experiments_root = args.experiments_root
+    decoder_sweep = args.decoder_sweep if args.decoder_sweep is not None else [1, 2, 3]
+    num_reruns = args.num_reruns
+    num_pairs = args.num_pairs
+    pair_dir = args.geodesic_pairs_dir or os.path.join(
+        experiments_root, "_shared_pairs"
+    )
+    os.makedirs(pair_dir, exist_ok=True)
+    pair_path = os.path.join(pair_dir, "geodesic_pairs.pt")
+
+    num_points = len(mnist_test_loader.dataset)
+    try:
+        pair_indices = torch.load(pair_path)
+        if pair_indices.shape != (num_pairs, 2):
+            raise ValueError("shape mismatch")
+    except (FileNotFoundError, ValueError):
+        torch.manual_seed(args.seed)
+        pair_indices = torch.randint(0, num_points, (num_pairs, 2))
+        for i in range(num_pairs):
+            while pair_indices[i, 0] == pair_indices[i, 1]:
+                pair_indices[i, 1] = torch.randint(0, num_points, (1,))
+        torch.save(pair_indices, pair_path)
+
+    num_interior = max(0, args.num_t - 2)
+    mc = args.mc_samples
+
+    cov_eucl_mean = []
+    cov_geo_mean = []
+    d_list = []
+
+    for D in decoder_sweep:
+        d_list.append(D)
+        eucl_dists = []  # list over successful runs: each is (num_pairs,)
+        geo_dists = []
+
+        for r in range(num_reruns):
+            exp_folder = os.path.join(experiments_root, f"d{D}_r{r:02d}")
+            model_path = os.path.join(exp_folder, "model.pt")
+            if not os.path.isfile(model_path):
+                print(f"skip missing model: {model_path}")
+                continue
+
+            meta = load_run_meta(exp_folder)
+            num_decoders = int(meta.get("num_decoders", D))
+            if num_decoders != D:
+                print(
+                    f"warning: {exp_folder} meta num_decoders={num_decoders} != D={D}"
+                )
+
+            model = build_ensemble_vae(
+                M, num_decoders, new_encoder, new_decoder, device_t
+            )
+            load_model_weights(model, model_path, device_t)
+            model.eval()
+
+            zs = []
+            with torch.no_grad():
+                for x, _y in mnist_test_loader:
+                    x = x.to(device_t)
+                    zs.append(model.encoder(x).mean.cpu())
+            z_all = torch.cat(zs, dim=0)
+
+            e_row = []
+            g_row = []
+            for p in range(num_pairs):
+                ia = int(pair_indices[p, 0])
+                ib = int(pair_indices[p, 1])
+                za = z_all[ia].to(device_t)
+                zb = z_all[ib].to(device_t)
+                eucl = torch.norm(za - zb).item()
+                e_row.append(eucl)
+
+                if num_decoders > 1:
+                    path = optimize_ensemble_geodesic(
+                        model,
+                        za,
+                        zb,
+                        num_interior,
+                        device_t,
+                        lr=args.geodesic_lr,
+                        steps=args.geodesic_steps,
+                        mc_samples=mc,
+                    )
+                else:
+                    path = optimize_geodesic(
+                        model,
+                        za,
+                        zb,
+                        num_interior,
+                        device_t,
+                        lr=args.geodesic_lr,
+                        steps=args.geodesic_steps,
+                    )
+                with torch.no_grad():
+                    E = curve_energy_at_path(
+                        model,
+                        path,
+                        use_ensemble=(num_decoders > 1),
+                        mc_samples=mc,
+                    )
+                g_row.append(torch.sqrt(E + 1e-12).item())
+
+            eucl_dists.append(np.array(e_row, dtype=np.float64))
+            geo_dists.append(np.array(g_row, dtype=np.float64))
+
+        if len(eucl_dists) == 0:
+            print(f"warning: no models for D={D}, skipping CoV")
+            cov_eucl_mean.append(float("nan"))
+            cov_geo_mean.append(float("nan"))
+            continue
+
+        stack_e = np.stack(eucl_dists, axis=0)
+        stack_g = np.stack(geo_dists, axis=0)
+        cov_e = []
+        cov_g = []
+        for p in range(num_pairs):
+            cov_e.append(np.std(stack_e[:, p]) / (np.mean(stack_e[:, p]) + 1e-12))
+            cov_g.append(np.std(stack_g[:, p]) / (np.mean(stack_g[:, p]) + 1e-12))
+        cov_eucl_mean.append(float(np.mean(cov_e)))
+        cov_geo_mean.append(float(np.mean(cov_g)))
+
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    ax.plot(
+        d_list,
+        cov_eucl_mean,
+        marker="o",
+        label="Euclidean distance CoV",
+    )
+    ax.plot(
+        d_list,
+        cov_geo_mean,
+        marker="s",
+        label="Geodesic distance CoV",
+    )
+    ax.set_xlabel("Number of ensemble decoders $D$")
+    ax.set_ylabel("Mean CoV over pairs")
+    ax.set_title("Distance reliability vs ensemble size (across VAE retrainings)")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    os.makedirs(args.image_output_dir, exist_ok=True)
+    out_path = os.path.join(args.image_output_dir, args.cov_figure_name)
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f"Saved CoV plot to {out_path}")
+    print("Per-D mean CoV (Euclidean):", list(zip(d_list, cov_eucl_mean)))
+    print("Per-D mean CoV (geodesic):", list(zip(d_list, cov_geo_mean)))
+
+
 if __name__ == "__main__":
     from torchvision import datasets, transforms
     from torchvision.utils import save_image
@@ -304,7 +610,7 @@ if __name__ == "__main__":
         "mode",
         type=str,
         default="train",
-        choices=["train", "sample", "eval", "geodesics"],
+        choices=["train", "sample", "eval", "geodesics", "cov"],
         help="what to do when running the script (default: %(default)s)",
     )
     parser.add_argument(
@@ -357,9 +663,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num-decoders",
         type=int,
-        default=3,
-        metavar="N",
-        help="number of decoders in the ensemble (default: %(default)s)",
+        default=1,
+        metavar="D",
+        help="ensemble size D: number of decoder networks (default: %(default)s)",
     )
     parser.add_argument(
         "--num-reruns",
@@ -406,7 +712,53 @@ if __name__ == "__main__":
         "--seed",
         type=int,
         default=0,
-        help="RNG seed for latent pair sampling (default: %(default)s)",
+        help="base RNG seed; geodesic pair sampling uses this (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--rerun-index",
+        type=int,
+        default=0,
+        metavar="N",
+        help="index of this VAE retraining (0..M-1); stored in run_meta for Part B (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--training-seed",
+        type=int,
+        default=None,
+        metavar="N",
+        help="torch RNG seed for training; default: --seed + --rerun-index * 100003",
+    )
+    parser.add_argument(
+        "--geodesic-pairs-dir",
+        type=str,
+        default=None,
+        help="where to read/write geodesic_pairs.pt (default: --experiment-folder)",
+    )
+    parser.add_argument(
+        "--mc-samples",
+        type=int,
+        default=16,
+        metavar="S",
+        help="Monte Carlo samples for ensemble curve energy (Part B) (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--experiments-root",
+        type=str,
+        default="experiments/partb",
+        help="cov mode: directory containing d<D>_r<RR> experiment folders (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--decoder-sweep",
+        nargs="*",
+        type=int,
+        default=None,
+        help="cov mode: list of D values (default: 1 2 3)",
+    )
+    parser.add_argument(
+        "--cov-figure-name",
+        type=str,
+        default="partb_cov.png",
+        help="cov mode: output PNG filename under --image-output-dir (default: %(default)s)",
     )
 
     args = parser.parse_args()
@@ -487,14 +839,14 @@ if __name__ == "__main__":
 
     # Choose mode to run
     if args.mode == "train":
+        train_seed = resolved_training_seed(args)
+        torch.manual_seed(train_seed)
 
         experiments_folder = args.experiment_folder
         os.makedirs(f"{experiments_folder}", exist_ok=True)
-        model = VAE(
-            GaussianPrior(M),
-            GaussianDecoder(new_decoder()),
-            GaussianEncoder(new_encoder()),
-        ).to(device)
+        model = build_ensemble_vae(
+            M, args.num_decoders, new_encoder, new_decoder, device
+        )
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
         train(
             model,
@@ -513,6 +865,10 @@ if __name__ == "__main__":
             "epochs_per_decoder": args.epochs_per_decoder,
             "latent_dim": args.latent_dim,
             "batch_size": args.batch_size,
+            "num_decoders": args.num_decoders,
+            "rerun_index": args.rerun_index,
+            "num_reruns": args.num_reruns,
+            "training_seed": train_seed,
             "experiment_folder": experiments_folder,
             "figure_prefix": args.figure_prefix or experiment_slug(experiments_folder),
             "trained_at_unix": time.time(),
@@ -523,6 +879,7 @@ if __name__ == "__main__":
         device_t = torch.device(device)
         meta = load_run_meta(args.experiment_folder)
         epochs = int(meta.get("epochs_per_decoder", args.epochs_per_decoder))
+        num_decoders = int(meta.get("num_decoders", args.num_decoders))
         prefix = (
             args.figure_prefix
             or meta.get("figure_prefix")
@@ -536,16 +893,13 @@ if __name__ == "__main__":
             args.image_output_dir, figure_filename(prefix, epochs, "reconstruction")
         )
 
-        model = VAE(
-            GaussianPrior(M),
-            GaussianDecoder(new_decoder()),
-            GaussianEncoder(new_encoder()),
-        ).to(device_t)
-        model.load_state_dict(
-            torch.load(
-                os.path.join(args.experiment_folder, "model.pt"),
-                map_location=device_t,
-            )
+        model = build_ensemble_vae(
+            M, num_decoders, new_encoder, new_decoder, device_t
+        )
+        load_model_weights(
+            model,
+            os.path.join(args.experiment_folder, "model.pt"),
+            device_t,
         )
         model.eval()
 
@@ -554,7 +908,7 @@ if __name__ == "__main__":
             save_image(samples.view(64, 1, 28, 28), path_samples)
 
             data = next(iter(mnist_test_loader))[0].to(device_t)
-            recon = model.decoder(model.encoder(data).mean).mean
+            recon = model.decoders[0](model.encoder(data).mean).mean
             save_image(
                 torch.cat([data.cpu(), recon.cpu()], dim=0), path_recon
             )
@@ -567,19 +921,18 @@ if __name__ == "__main__":
         if meta:
             print(
                 f"Run meta: epochs_per_decoder={meta.get('epochs_per_decoder')}, "
-                f"figure_prefix={meta.get('figure_prefix')}"
+                f"figure_prefix={meta.get('figure_prefix')}, "
+                f"num_decoders={meta.get('num_decoders')}, "
+                f"rerun_index={meta.get('rerun_index')}"
             )
-        # Load trained model
-        model = VAE(
-            GaussianPrior(M),
-            GaussianDecoder(new_decoder()),
-            GaussianEncoder(new_encoder()),
-        ).to(device_t)
-        model.load_state_dict(
-            torch.load(
-                os.path.join(args.experiment_folder, "model.pt"),
-                map_location=device_t,
-            )
+        num_decoders = int(meta.get("num_decoders", args.num_decoders))
+        model = build_ensemble_vae(
+            M, num_decoders, new_encoder, new_decoder, device_t
+        )
+        load_model_weights(
+            model,
+            os.path.join(args.experiment_folder, "model.pt"),
+            device_t,
         )
         model.eval()
 
@@ -607,13 +960,12 @@ if __name__ == "__main__":
             args.image_output_dir, figure_filename(prefix, epochs, "geodesics")
         )
 
-        model = VAE(
-            GaussianPrior(M),
-            GaussianDecoder(new_decoder()),
-            GaussianEncoder(new_encoder()),
-        ).to(device_t)
+        num_decoders = int(meta.get("num_decoders", args.num_decoders))
+        model = build_ensemble_vae(
+            M, num_decoders, new_encoder, new_decoder, device_t
+        )
         state_path = os.path.join(args.experiment_folder, "model.pt")
-        model.load_state_dict(torch.load(state_path, map_location=device_t))
+        load_model_weights(model, state_path, device_t)
         model.eval()
 
         num_interior = max(0, args.num_t - 2)
@@ -631,8 +983,11 @@ if __name__ == "__main__":
         num_pairs = args.num_pairs
         num_points = z_train.shape[0]
 
+        pair_dir = args.geodesic_pairs_dir or args.experiment_folder
+        os.makedirs(pair_dir, exist_ok=True)
+        pair_path = os.path.join(pair_dir, "geodesic_pairs.pt")
         try:
-            pair_indices = torch.load(os.path.join(args.experiment_folder, "geodesic_pairs.pt"))
+            pair_indices = torch.load(pair_path)
             if pair_indices.shape != (num_pairs, 2):
                 print(f"Warning: Loaded pair indices shape {pair_indices.shape} does not match expected {(num_pairs, 2)}. Resampling.")
                 raise ValueError("Invalid pair indices shape")
@@ -641,21 +996,34 @@ if __name__ == "__main__":
             for i in range(num_pairs):
                 while pair_indices[i, 0] == pair_indices[i, 1]:
                     pair_indices[i, 1] = torch.randint(0, num_points, (1,))
-            torch.save(pair_indices, os.path.join(args.experiment_folder, "geodesic_pairs.pt"))
+            torch.save(pair_indices, pair_path)
 
         geodesics_xy = []
+        use_ensemble_geo = num_decoders > 1
         for i in tqdm(range(num_pairs), desc="geodesics"):
             z0 = z_train[pair_indices[i, 0]].to(device_t)
-            z1 = z_train[pair_indices[i, 1]].to(device_t)  
-            path = optimize_geodesic(
-                model,
-                z0,
-                z1,
-                num_interior,
-                device_t,
-                lr=args.geodesic_lr,
-                steps=args.geodesic_steps,
-            )
+            z1 = z_train[pair_indices[i, 1]].to(device_t)
+            if use_ensemble_geo:
+                path = optimize_ensemble_geodesic(
+                    model,
+                    z0,
+                    z1,
+                    num_interior,
+                    device_t,
+                    lr=args.geodesic_lr,
+                    steps=args.geodesic_steps,
+                    mc_samples=args.mc_samples,
+                )
+            else:
+                path = optimize_geodesic(
+                    model,
+                    z0,
+                    z1,
+                    num_interior,
+                    device_t,
+                    lr=args.geodesic_lr,
+                    steps=args.geodesic_steps,
+                )
             geodesics_xy.append(path.cpu().numpy())
         
         z_train_np = z_train.numpy()
@@ -677,8 +1045,17 @@ if __name__ == "__main__":
         ax.set_xlabel(r"$z_1$")
         ax.set_ylabel(r"$z_2$")
         ax.legend(loc="best", fontsize=9)
-        ax.set_title("Encoder means + pull-back geodesics (decoder mean)")
+        if use_ensemble_geo:
+            ax.set_title(
+                r"Encoder means + model-average geodesics ($D=%d$, MC=%d)"
+                % (num_decoders, args.mc_samples)
+            )
+        else:
+            ax.set_title("Encoder means + pull-back geodesics (decoder mean)")
         fig.tight_layout()
         fig.savefig(path_geodesics, dpi=150)
         plt.close(fig)
         print(f"Saved plot to {path_geodesics}")
+
+    elif args.mode == "cov":
+        run_cov_mode(args, M, new_encoder, new_decoder, mnist_test_loader)

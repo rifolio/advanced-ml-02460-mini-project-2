@@ -1,0 +1,12 @@
+{
+  "epochs_per_decoder": 150,
+  "latent_dim": 2,
+  "batch_size": 32,
+  "num_decoders": 3,
+  "rerun_index": 1,
+  "num_reruns": 10,
+  "training_seed": 100003,
+  "experiment_folder": "experiments/partb/d3_r01",
+  "figure_prefix": "d3_r01",
+  "trained_at_unix": 1774540385.4883368
+}
