@@ -41,6 +41,15 @@ MANIFEST
 *.pth
 *.pt
 
+# Track mini-project experiment checkpoints (override *.pt above)
+!experiment/model.pt
+!experiment_long/model.pt
+
+# Legacy figure outputs at repo root (use report_images/ from ensemble_vae.py)
+/geodesics.png
+/reconstruction_means.png
+/samples.png
+
 # Data and outputs
 data/
 outputs/

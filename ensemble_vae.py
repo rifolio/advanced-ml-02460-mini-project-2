@@ -11,10 +11,37 @@ import torch.nn as nn
 import torch.distributions as td
 import torch.utils.data
 from tqdm import tqdm
-from copy import deepcopy
+import json
 import os
-import math
+import time
 import matplotlib.pyplot as plt
+
+RUN_META_FILENAME = "run_meta.json"
+
+
+def experiment_slug(experiment_folder):
+    return os.path.basename(os.path.normpath(experiment_folder))
+
+
+def load_run_meta(experiment_folder):
+    path = os.path.join(experiment_folder, RUN_META_FILENAME)
+    if not os.path.isfile(path):
+        return {}
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_run_meta(experiment_folder, meta):
+    os.makedirs(experiment_folder, exist_ok=True)
+    path = os.path.join(experiment_folder, RUN_META_FILENAME)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
+
+
+def figure_filename(prefix, epochs, kind):
+    """kind: samples | reconstruction | geodesics"""
+    safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in str(prefix))
+    return f"{safe}_e{int(epochs)}_{kind}.png"
 
 class GaussianPrior(nn.Module):
     def __init__(self, M):
@@ -206,6 +233,65 @@ def train(model, optimizer, data_loader, epochs, device):
                 break
 
 
+def decoder_mean_flat(model, z):
+    """
+    Decoder mean f(z) as a flat vector for pull-back distances in image space.
+
+    z: (batch, M) or (M,)
+    """
+    if z.dim() == 1:
+        z = z.unsqueeze(0)
+    means = model.decoder.decoder_net(z)
+    return means.view(z.shape[0], -1)
+
+
+def pullback_curve_energy(model, z_path):
+    """
+    Discrete pull-back energy sum_i ||f(z_{i+1}) - f(z_i)||^2 for the decoder mean f.
+
+    z_path: (K+1, M) with requires_grad as needed for interior points.
+    """
+    f = decoder_mean_flat(model, z_path)
+    return torch.sum((f[1:] - f[:-1]).pow(2))
+
+
+def optimize_geodesic(
+    model,
+    z0,
+    z1,
+    num_interior,
+    device,
+    lr=0.05,
+    steps=500,
+):
+    """
+    Minimize pull-back energy over interior waypoints; endpoints fixed.
+
+    z0, z1: (M,) on device
+    Returns: (num_interior + 2, M) latent polyline
+    """
+    z0 = z0.detach().clone()
+    z1 = z1.detach().clone()
+    if num_interior <= 0:
+        return torch.stack([z0, z1], dim=0)
+
+    ts = torch.linspace(0.0, 1.0, num_interior + 2, device=device)[1:-1]
+    init = torch.stack([(1.0 - t) * z0 + t * z1 for t in ts], dim=0)
+    z_in = nn.Parameter(init.clone())
+    opt = torch.optim.Adam([z_in], lr=lr)
+
+    for _ in range(steps):
+        opt.zero_grad()
+        z_path = torch.cat([z0.unsqueeze(0), z_in, z1.unsqueeze(0)], dim=0)
+        e = pullback_curve_energy(model, z_path)
+        e.backward()
+        opt.step()
+
+    with torch.no_grad():
+        z_path = torch.cat([z0.unsqueeze(0), z_in.detach(), z1.unsqueeze(0)], dim=0)
+    return z_path
+
+
 if __name__ == "__main__":
     from torchvision import datasets, transforms
     from torchvision.utils import save_image
@@ -228,10 +314,16 @@ if __name__ == "__main__":
         help="folder to save and load experiment results in (default: %(default)s)",
     )
     parser.add_argument(
-        "--samples",
+        "--image-output-dir",
         type=str,
-        default="samples.png",
-        help="file to save samples in (default: %(default)s)",
+        default="report_images",
+        help="directory for all PNG outputs (samples, reconstructions, geodesics) (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--figure-prefix",
+        type=str,
+        default=None,
+        help="filename prefix for figures; default is the experiment folder name (e.g. experiment_long)",
     )
 
     parser.add_argument(
@@ -288,7 +380,33 @@ if __name__ == "__main__":
         type=int,
         default=20,
         metavar="N",
-        help="number of points along the curve (default: %(default)s)",
+        help="total points along each geodesic polyline including endpoints (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--num-pairs",
+        type=int,
+        default=25,
+        metavar="N",
+        help="number of random latent pairs for geodesics (Part A: at least 25) (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--geodesic-lr",
+        type=float,
+        default=0.05,
+        help="learning rate for geodesic waypoint optimization (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--geodesic-steps",
+        type=int,
+        default=500,
+        metavar="N",
+        help="optimizer steps per geodesic (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="RNG seed for latent pair sampling (default: %(default)s)",
     )
 
     args = parser.parse_args()
@@ -391,51 +509,160 @@ if __name__ == "__main__":
             model.state_dict(),
             f"{experiments_folder}/model.pt",
         )
+        run_meta = {
+            "epochs_per_decoder": args.epochs_per_decoder,
+            "latent_dim": args.latent_dim,
+            "batch_size": args.batch_size,
+            "experiment_folder": experiments_folder,
+            "figure_prefix": args.figure_prefix or experiment_slug(experiments_folder),
+            "trained_at_unix": time.time(),
+        }
+        save_run_meta(experiments_folder, run_meta)
 
     elif args.mode == "sample":
+        device_t = torch.device(device)
+        meta = load_run_meta(args.experiment_folder)
+        epochs = int(meta.get("epochs_per_decoder", args.epochs_per_decoder))
+        prefix = (
+            args.figure_prefix
+            or meta.get("figure_prefix")
+            or experiment_slug(args.experiment_folder)
+        )
+        os.makedirs(args.image_output_dir, exist_ok=True)
+        path_samples = os.path.join(
+            args.image_output_dir, figure_filename(prefix, epochs, "samples")
+        )
+        path_recon = os.path.join(
+            args.image_output_dir, figure_filename(prefix, epochs, "reconstruction")
+        )
+
         model = VAE(
             GaussianPrior(M),
             GaussianDecoder(new_decoder()),
             GaussianEncoder(new_encoder()),
-        ).to(device)
-        model.load_state_dict(torch.load(args.experiment_folder + "/model.pt"))
+        ).to(device_t)
+        model.load_state_dict(
+            torch.load(
+                os.path.join(args.experiment_folder, "model.pt"),
+                map_location=device_t,
+            )
+        )
         model.eval()
 
         with torch.no_grad():
             samples = (model.sample(64)).cpu()
-            save_image(samples.view(64, 1, 28, 28), args.samples)
+            save_image(samples.view(64, 1, 28, 28), path_samples)
 
-            data = next(iter(mnist_test_loader))[0].to(device)
+            data = next(iter(mnist_test_loader))[0].to(device_t)
             recon = model.decoder(model.encoder(data).mean).mean
             save_image(
-                torch.cat([data.cpu(), recon.cpu()], dim=0), "reconstruction_means.png"
+                torch.cat([data.cpu(), recon.cpu()], dim=0), path_recon
             )
+        print(f"Saved samples to {path_samples}")
+        print(f"Saved reconstructions to {path_recon}")
 
     elif args.mode == "eval":
+        device_t = torch.device(device)
+        meta = load_run_meta(args.experiment_folder)
+        if meta:
+            print(
+                f"Run meta: epochs_per_decoder={meta.get('epochs_per_decoder')}, "
+                f"figure_prefix={meta.get('figure_prefix')}"
+            )
         # Load trained model
         model = VAE(
             GaussianPrior(M),
             GaussianDecoder(new_decoder()),
             GaussianEncoder(new_encoder()),
-        ).to(device)
-        model.load_state_dict(torch.load(args.experiment_folder + "/model.pt"))
+        ).to(device_t)
+        model.load_state_dict(
+            torch.load(
+                os.path.join(args.experiment_folder, "model.pt"),
+                map_location=device_t,
+            )
+        )
         model.eval()
 
         elbos = []
         with torch.no_grad():
             for x, y in mnist_test_loader:
-                x = x.to(device)
+                x = x.to(device_t)
                 elbo = model.elbo(x)
                 elbos.append(elbo)
         mean_elbo = torch.tensor(elbos).mean()
         print("Print mean test elbo:", mean_elbo)
 
     elif args.mode == "geodesics":
+        torch.manual_seed(args.seed)
+        device_t = torch.device(device)
+        meta = load_run_meta(args.experiment_folder)
+        epochs = int(meta.get("epochs_per_decoder", args.epochs_per_decoder))
+        prefix = (
+            args.figure_prefix
+            or meta.get("figure_prefix")
+            or experiment_slug(args.experiment_folder)
+        )
+        os.makedirs(args.image_output_dir, exist_ok=True)
+        path_geodesics = os.path.join(
+            args.image_output_dir, figure_filename(prefix, epochs, "geodesics")
+        )
 
         model = VAE(
             GaussianPrior(M),
             GaussianDecoder(new_decoder()),
             GaussianEncoder(new_encoder()),
-        ).to(device)
-        model.load_state_dict(torch.load(args.experiment_folder + "/model.pt"))
+        ).to(device_t)
+        state_path = os.path.join(args.experiment_folder, "model.pt")
+        model.load_state_dict(torch.load(state_path, map_location=device_t))
         model.eval()
+
+        num_interior = max(0, args.num_t - 2)
+
+        zs, ys = [], []
+        with torch.no_grad():
+            for x, y in mnist_train_loader:
+                x = x.to(device_t)
+                q = model.encoder(x)
+                zs.append(q.mean.cpu())
+                ys.append(y)
+        z_train = torch.cat(zs, dim=0).numpy()
+        y_train = torch.cat(ys, dim=0).numpy()
+
+        num_pairs = args.num_pairs
+        z_pool = torch.randn(num_pairs * 2, M, device=device_t)
+        geodesics_xy = []
+        for i in tqdm(range(num_pairs), desc="geodesics"):
+            z0 = z_pool[2 * i]
+            z1 = z_pool[2 * i + 1]
+            path = optimize_geodesic(
+                model,
+                z0,
+                z1,
+                num_interior,
+                device_t,
+                lr=args.geodesic_lr,
+                steps=args.geodesic_steps,
+            )
+            geodesics_xy.append(path.cpu().numpy())
+
+        fig, ax = plt.subplots(figsize=(8, 8))
+        for c in range(num_classes):
+            mask = y_train == c
+            ax.scatter(
+                z_train[mask, 0],
+                z_train[mask, 1],
+                s=10,
+                alpha=0.55,
+                label=f"class {c}",
+            )
+        for path in geodesics_xy:
+            ax.plot(path[:, 0], path[:, 1], color="0.2", lw=0.85, alpha=0.65)
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_xlabel(r"$z_1$")
+        ax.set_ylabel(r"$z_2$")
+        ax.legend(loc="best", fontsize=9)
+        ax.set_title("Encoder means + pull-back geodesics (decoder mean)")
+        fig.tight_layout()
+        fig.savefig(path_geodesics, dpi=150)
+        plt.close(fig)
+        print(f"Saved plot to {path_geodesics}")
