@@ -999,10 +999,12 @@ if __name__ == "__main__":
             torch.save(pair_indices, pair_path)
 
         geodesics_xy = []
+        z_endpoints = []  # Store (z0, z1) pairs for plotting straight lines
         use_ensemble_geo = num_decoders > 1
         for i in tqdm(range(num_pairs), desc="geodesics"):
             z0 = z_train[pair_indices[i, 0]].to(device_t)
             z1 = z_train[pair_indices[i, 1]].to(device_t)
+            z_endpoints.append((z0.cpu().numpy(), z1.cpu().numpy()))
             if use_ensemble_geo:
                 path = optimize_ensemble_geodesic(
                     model,
@@ -1030,6 +1032,8 @@ if __name__ == "__main__":
         y_train_np = y_train.numpy()
 
         fig, ax = plt.subplots(figsize=(8, 8))
+        
+        # Plot data points
         for c in range(num_classes):
             mask = y_train == c
             ax.scatter(
@@ -1039,8 +1043,25 @@ if __name__ == "__main__":
                 alpha=0.55,
                 label=f"class {c}",
             )
-        for path in geodesics_xy:
-            ax.plot(path[:, 0], path[:, 1], color="0.2", lw=0.85, alpha=0.65)
+        
+        # Plot geodesics with different colors and straight lines
+        colors = plt.cm.tab10(np.linspace(0, 1, max(10, num_pairs)))
+        for idx, (path, (z0, z1)) in enumerate(zip(geodesics_xy, z_endpoints)):
+            # Plot straight line (dotted, only once in legend)
+            if idx == 0:
+                ax.plot([z0[0], z1[0]], [z0[1], z1[1]], color='gray', linestyle='--', 
+                       lw=1.0, alpha=0.6, label='Straight line')
+            else:
+                ax.plot([z0[0], z1[0]], [z0[1], z1[1]], color='gray', linestyle='--', 
+                       lw=1.0, alpha=0.6)
+            
+            # Plot geodesic (only once in legend)
+            if idx == 0:
+                ax.plot(path[:, 0], path[:, 1], color=colors[idx % len(colors)], lw=0.9, 
+                       alpha=0.8, label='Pullback geodesic')
+            else:
+                ax.plot(path[:, 0], path[:, 1], color=colors[idx % len(colors)], lw=0.9, alpha=0.8)
+        
         ax.set_aspect("equal", adjustable="box")
         ax.set_xlabel(r"$z_1$")
         ax.set_ylabel(r"$z_2$")
