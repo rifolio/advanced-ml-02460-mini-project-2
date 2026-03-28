@@ -60,6 +60,18 @@ def migrate_state_dict_to_ensemble(state_dict):
             out[k] = v
     return out
 
+def geodesic_length(model, z_path):
+    """True arc length — sum of decoded segment lengths after optimization."""
+    with torch.no_grad():
+        f = decoder_mean_flat(model, z_path)              # (N, 784)
+        segment_lengths = torch.norm(f[1:] - f[:-1], dim=1)  # (N-1,)
+    return segment_lengths.sum().item()
+
+
+def euclidean_length(z_path):
+    """Straight-line distance between endpoints in latent space."""
+    return torch.norm(z_path[-1] - z_path[0]).item()
+
 
 class GaussianPrior(nn.Module):
     def __init__(self, M):
@@ -1000,6 +1012,8 @@ if __name__ == "__main__":
 
         geodesics_xy = []
         z_endpoints = []  # Store (z0, z1) pairs for plotting straight lines
+        geo_lengths  = []
+        eucl_lengths = []
         use_ensemble_geo = num_decoders > 1
         for i in tqdm(range(num_pairs), desc="geodesics"):
             z0 = z_train[pair_indices[i, 0]].to(device_t)
@@ -1027,6 +1041,13 @@ if __name__ == "__main__":
                     steps=args.geodesic_steps,
                 )
             geodesics_xy.append(path.cpu().numpy())
+            geo_lengths.append(geodesic_length(model, path))
+            eucl_lengths.append(euclidean_length(path))
+        
+        print(f"\n{'Pair':<6} {'Euclidean':>12} {'Geodesic':>12}")
+        print("-" * 52)
+        for i in range(num_pairs):
+            print(f"{i:<6} {eucl_lengths[i]:>12.4f} {geo_lengths[i]:>12.4f}")
         
         z_train_np = z_train.numpy()
         y_train_np = y_train.numpy()
