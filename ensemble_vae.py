@@ -322,7 +322,8 @@ def ensemble_curve_energy(model, z_path, mc_samples=16):
     Model-average discrete curve energy (Part B, Eq. 1):
     sum_i E_{l,k}[ ||f_l(z_i) - f_k(z_{i+1})||^2 ], approximated by Monte Carlo.
 
-    When D=1 this equals pullback_curve_energy (same f_0 at both endpoints of each segment).
+    Batched: each decoder is run once on all waypoints, then MC sampling is done
+    via tensor indexing — no Python loops over segments or samples.
     """
     if not hasattr(model, "decoders"):
         return pullback_curve_energy(model, z_path)
@@ -335,19 +336,21 @@ def ensemble_curve_energy(model, z_path, mc_samples=16):
         return z_path.sum() * 0.0
 
     device = z_path.device
-    total = z_path.new_zeros(())
-    for i in range(k_seg):
-        zi = z_path[i : i + 1]
-        zj = z_path[i + 1 : i + 2]
-        seg_sum = z_path.new_zeros(())
-        for _ in range(mc_samples):
-            li = int(torch.randint(0, d_dec, (1,), device=device).item())
-            ki = int(torch.randint(0, d_dec, (1,), device=device).item())
-            fi = decoder_mean_flat(model, zi, li)
-            fj = decoder_mean_flat(model, zj, ki)
-            seg_sum = seg_sum + (fi - fj).pow(2).sum()
-        total = total + seg_sum / float(mc_samples)
-    return total
+
+    # One forward pass per decoder over all waypoints: (D, N, 784)
+    all_f = torch.stack(
+        [decoder_mean_flat(model, z_path, d) for d in range(d_dec)], dim=0
+    )
+
+    # Sample all MC decoder indices at once
+    li = torch.randint(0, d_dec, (mc_samples,), device=device)  # (S,)
+    ki = torch.randint(0, d_dec, (mc_samples,), device=device)  # (S,)
+
+    # Gather left/right endpoints for all (MC sample, segment) pairs
+    fi = all_f[li][:, :k_seg, :]  # (S, k_seg, 784)
+    fj = all_f[ki][:, 1:,    :]  # (S, k_seg, 784)
+
+    return (fi - fj).pow(2).sum() / mc_samples
 
 
 def decoder_uncertainty_grid(model, xlim, ylim, resolution=80, device="cpu"):
