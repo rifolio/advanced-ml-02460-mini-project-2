@@ -269,7 +269,6 @@ def train(model, optimizer, data_loader, epochs, device):
             try:
                 x = next(iter(data_loader))[0]
                 x = noise(x.to(device))
-                model = model
                 optimizer.zero_grad()
                 # from IPython import embed; embed()
                 loss = model(x)
@@ -349,6 +348,30 @@ def ensemble_curve_energy(model, z_path, mc_samples=16):
             seg_sum = seg_sum + (fi - fj).pow(2).sum()
         total = total + seg_sum / float(mc_samples)
     return total
+
+
+def decoder_uncertainty_grid(model, xlim, ylim, resolution=80, device="cpu"):
+    """
+    Compute per-grid-point decoder std dev (mean over pixels) for the ensemble heatmap.
+    Returns (std_map, xs, ys) where std_map is (resolution, resolution).
+    Returns (None, None, None) if the model has fewer than 2 decoders.
+    """
+    if not hasattr(model, "decoders") or len(model.decoders) < 2:
+        return None, None, None
+    xs = np.linspace(xlim[0], xlim[1], resolution)
+    ys = np.linspace(ylim[0], ylim[1], resolution)
+    xx, yy = np.meshgrid(xs, ys)
+    z_flat = torch.tensor(
+        np.stack([xx.ravel(), yy.ravel()], axis=1), dtype=torch.float32
+    ).to(device)
+    with torch.no_grad():
+        outputs = []
+        for dec in model.decoders:
+            f = dec.decoder_net(z_flat).view(z_flat.shape[0], -1)  # (N, 784)
+            outputs.append(f.cpu().numpy())
+    outputs = np.stack(outputs, axis=0)          # (D, N, 784)
+    std_map = outputs.std(axis=0).mean(axis=1).reshape(xx.shape)  # (H, W)
+    return std_map, xs, ys
 
 
 def optimize_geodesic(  
@@ -822,10 +845,10 @@ if __name__ == "__main__":
     def new_encoder():
         encoder_net = nn.Sequential(
             nn.Conv2d(1, 16, 3, stride=2, padding=1),
-            nn.Softmax(),
+            nn.ReLU(),
             nn.BatchNorm2d(16),
             nn.Conv2d(16, 32, 3, stride=2, padding=1),
-            nn.Softmax(),
+            nn.ReLU(),
             nn.BatchNorm2d(32),
             nn.Conv2d(32, 32, 3, stride=2, padding=1),
             nn.Flatten(),
@@ -837,13 +860,13 @@ if __name__ == "__main__":
         decoder_net = nn.Sequential(
             nn.Linear(M, 512),
             nn.Unflatten(-1, (32, 4, 4)),
-            nn.Softmax(),
+            nn.ReLU(),
             nn.BatchNorm2d(32),
             nn.ConvTranspose2d(32, 32, 3, stride=2, padding=1, output_padding=0),
-            nn.Softmax(),
+            nn.ReLU(),
             nn.BatchNorm2d(32),
             nn.ConvTranspose2d(32, 16, 3, stride=2, padding=1, output_padding=1),
-            nn.Softmax(),
+            nn.ReLU(),
             nn.BatchNorm2d(16),
             nn.ConvTranspose2d(16, 1, 3, stride=2, padding=1, output_padding=1),
         )
@@ -867,8 +890,6 @@ if __name__ == "__main__":
             args.epochs_per_decoder,
             args.device,
         )
-        os.makedirs(f"{experiments_folder}", exist_ok=True)
-
         torch.save(
             model.state_dict(),
             f"{experiments_folder}/model.pt",
@@ -1052,48 +1073,72 @@ if __name__ == "__main__":
         z_train_np = z_train.numpy()
         y_train_np = y_train.numpy()
 
-        fig, ax = plt.subplots(figsize=(8, 8))
-        
-        # Plot data points
-        for c in range(num_classes):
-            mask = y_train == c
-            ax.scatter(
-                z_train_np[mask, 0],
-                z_train_np[mask, 1],
-                s=10,
-                alpha=0.55,
-                label=f"class {c}",
-            )
-        
-        # Plot geodesics with different colors and straight lines
-        colors = plt.cm.tab10(np.linspace(0, 1, max(10, num_pairs)))
-        for idx, (path, (z0, z1)) in enumerate(zip(geodesics_xy, z_endpoints)):
-            # Plot straight line (dotted, only once in legend)
-            if idx == 0:
-                ax.plot([z0[0], z1[0]], [z0[1], z1[1]], color='gray', linestyle='--', 
-                       lw=1.0, alpha=0.6, label='Straight line')
-            else:
-                ax.plot([z0[0], z1[0]], [z0[1], z1[1]], color='gray', linestyle='--', 
-                       lw=1.0, alpha=0.6)
-            
-            # Plot geodesic (only once in legend)
-            if idx == 0:
-                ax.plot(path[:, 0], path[:, 1], color=colors[idx % len(colors)], lw=0.9, 
-                       alpha=0.8, label='Pullback geodesic')
-            else:
-                ax.plot(path[:, 0], path[:, 1], color=colors[idx % len(colors)], lw=0.9, alpha=0.8)
-        
-        ax.set_aspect("equal", adjustable="box")
-        ax.set_xlabel(r"$z_1$")
-        ax.set_ylabel(r"$z_2$")
-        ax.legend(loc="best", fontsize=9)
+        pad = 0.5
+        xlim = (z_train_np[:, 0].min() - pad, z_train_np[:, 0].max() + pad)
+        ylim = (z_train_np[:, 1].min() - pad, z_train_np[:, 1].max() + pad)
+
+        fig, ax = plt.subplots(figsize=(7, 6))
+
+        # Uncertainty heatmap background for ensemble plots
         if use_ensemble_geo:
-            ax.set_title(
-                r"Encoder means + model-average geodesics ($D=%d$, MC=%d)"
-                % (num_decoders, args.mc_samples)
+            std_map, _xs, _ys = decoder_uncertainty_grid(
+                model, xlim, ylim, resolution=80, device=device_t
             )
+            if std_map is not None:
+                im = ax.imshow(
+                    std_map,
+                    origin="lower",
+                    extent=[xlim[0], xlim[1], ylim[0], ylim[1]],
+                    aspect="auto",
+                    cmap="plasma",
+                    alpha=0.85,
+                )
+                cbar = fig.colorbar(im, ax=ax, pad=0.02)
+                cbar.set_label("Decoder Uncertainty (Std Dev)", fontsize=9)
+
+        # Scatter latent data points
+        class_colors = ["#5599ff", "#ff8833", "#44bb66"]
+        for c in range(num_classes):
+            mask = y_train_np == c
+            ax.scatter(
+                z_train_np[mask, 0], z_train_np[mask, 1],
+                s=5, alpha=0.4, color=class_colors[c], label=f"Class {c}",
+            )
+
+        # Geodesic curves, Euclidean reference lines, and endpoint markers
+        curve_colors = plt.cm.tab10(np.linspace(0, 1, max(10, num_pairs)))
+        ep_line_color = "white" if use_ensemble_geo else "gray"
+        ep_marker_color = "white" if use_ensemble_geo else "black"
+        ep_xs, ep_ys = [], []
+        for idx, (path, (z0, z1)) in enumerate(zip(geodesics_xy, z_endpoints)):
+            c = curve_colors[idx % len(curve_colors)]
+            ax.plot(
+                [z0[0], z1[0]], [z0[1], z1[1]],
+                color=ep_line_color, linestyle="--", lw=0.8, alpha=0.5,
+                label="Euclidean Path" if idx == 0 else None,
+            )
+            ax.plot(
+                path[:, 0], path[:, 1], color=c, lw=1.5, alpha=0.9,
+                label="Geodesic Path" if idx == 0 else None,
+            )
+            ep_xs += [z0[0], z1[0]]
+            ep_ys += [z0[1], z1[1]]
+
+        ax.scatter(
+            ep_xs, ep_ys, s=40, facecolors="none",
+            edgecolors=ep_marker_color, linewidths=1.2, zorder=5,
+            label="Start/End Points",
+        )
+
+        ax.set_xlim(xlim)
+        ax.set_ylim(ylim)
+        ax.set_xlabel("z1", fontsize=11)
+        ax.set_ylabel("z2", fontsize=11)
+        ax.legend(loc="lower left", fontsize=8, framealpha=0.7)
+        if use_ensemble_geo:
+            ax.set_title("Geodesic For Ensemble VAE", fontsize=12)
         else:
-            ax.set_title("Encoder means + pull-back geodesics (decoder mean)")
+            ax.set_title("Geodesic in Latent Space", fontsize=12)
         fig.tight_layout()
         fig.savefig(path_geodesics, dpi=150)
         plt.close(fig)
