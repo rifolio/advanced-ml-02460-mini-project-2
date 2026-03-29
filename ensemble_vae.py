@@ -322,7 +322,8 @@ def ensemble_curve_energy(model, z_path, mc_samples=16):
     Model-average discrete curve energy (Part B, Eq. 1):
     sum_i E_{l,k}[ ||f_l(z_i) - f_k(z_{i+1})||^2 ], approximated by Monte Carlo.
 
-    When D=1 this equals pullback_curve_energy (same f_0 at both endpoints of each segment).
+    Batched: each decoder is run once on all waypoints, then MC sampling is done
+    via tensor indexing — no Python loops over segments or samples.
     """
     if not hasattr(model, "decoders"):
         return pullback_curve_energy(model, z_path)
@@ -335,19 +336,21 @@ def ensemble_curve_energy(model, z_path, mc_samples=16):
         return z_path.sum() * 0.0
 
     device = z_path.device
-    total = z_path.new_zeros(())
-    for i in range(k_seg):
-        zi = z_path[i : i + 1]
-        zj = z_path[i + 1 : i + 2]
-        seg_sum = z_path.new_zeros(())
-        for _ in range(mc_samples):
-            li = int(torch.randint(0, d_dec, (1,), device=device).item())
-            ki = int(torch.randint(0, d_dec, (1,), device=device).item())
-            fi = decoder_mean_flat(model, zi, li)
-            fj = decoder_mean_flat(model, zj, ki)
-            seg_sum = seg_sum + (fi - fj).pow(2).sum()
-        total = total + seg_sum / float(mc_samples)
-    return total
+
+    # One forward pass per decoder over all waypoints: (D, N, 784)
+    all_f = torch.stack(
+        [decoder_mean_flat(model, z_path, d) for d in range(d_dec)], dim=0
+    )
+
+    # Sample all MC decoder indices at once
+    li = torch.randint(0, d_dec, (mc_samples,), device=device)  # (S,)
+    ki = torch.randint(0, d_dec, (mc_samples,), device=device)  # (S,)
+
+    # Gather left/right endpoints for all (MC sample, segment) pairs
+    fi = all_f[li][:, :k_seg, :]  # (S, k_seg, 784)
+    fj = all_f[ki][:, 1:,    :]  # (S, k_seg, 784)
+
+    return (fi - fj).pow(2).sum() / mc_samples
 
 
 def decoder_uncertainty_grid(model, xlim, ylim, resolution=80, device="cpu"):
@@ -510,100 +513,121 @@ def run_cov_mode(
     num_interior = max(0, args.num_t - 2)
     mc = args.mc_samples
 
-    cov_eucl_mean = []
-    cov_geo_mean = []
-    d_list = []
-
+    # Pre-scan available runs so global ETA reflects actual work.
+    runs_by_d = {}
+    total_runs = 0
     for D in decoder_sweep:
-        d_list.append(D)
-        eucl_dists = []  # list over successful runs: each is (num_pairs,)
-        geo_dists = []
-
+        d_runs = []
         for r in range(num_reruns):
             exp_folder = os.path.join(experiments_root, f"d{D}_r{r:02d}")
             model_path = os.path.join(exp_folder, "model.pt")
             if not os.path.isfile(model_path):
-                print(f"skip missing model: {model_path}")
+                tqdm.write(f"skip missing model: {model_path}")
+                continue
+            d_runs.append((r, exp_folder, model_path))
+        runs_by_d[D] = d_runs
+        total_runs += len(d_runs)
+
+    total_pair_jobs = total_runs * num_pairs
+
+    cov_eucl_mean = []
+    cov_geo_mean = []
+    d_list = []
+
+    with tqdm(
+        total=total_pair_jobs,
+        desc="cov geodesic pairs",
+        unit="pair",
+        dynamic_ncols=True,
+    ) as pbar_pairs:
+        for D in decoder_sweep:
+            d_list.append(D)
+            eucl_dists = []  # list over successful runs: each is (num_pairs,)
+            geo_dists = []
+            d_runs = runs_by_d[D]
+
+            if len(d_runs) == 0:
+                tqdm.write(f"warning: no models for D={D}, skipping CoV")
+                cov_eucl_mean.append(float("nan"))
+                cov_geo_mean.append(float("nan"))
                 continue
 
-            meta = load_run_meta(exp_folder)
-            num_decoders = int(meta.get("num_decoders", D))
-            if num_decoders != D:
-                print(
-                    f"warning: {exp_folder} meta num_decoders={num_decoders} != D={D}"
+            for r, exp_folder, model_path in d_runs:
+                pbar_pairs.set_postfix_str(f"D={D}, r={r:02d}")
+
+                meta = load_run_meta(exp_folder)
+                num_decoders = int(meta.get("num_decoders", D))
+                if num_decoders != D:
+                    tqdm.write(
+                        f"warning: {exp_folder} meta num_decoders={num_decoders} != D={D}"
+                    )
+
+                model = build_ensemble_vae(
+                    M, num_decoders, new_encoder, new_decoder, device_t
                 )
+                load_model_weights(model, model_path, device_t)
+                model.eval()
 
-            model = build_ensemble_vae(
-                M, num_decoders, new_encoder, new_decoder, device_t
-            )
-            load_model_weights(model, model_path, device_t)
-            model.eval()
-
-            zs = []
-            with torch.no_grad():
-                for x, _y in mnist_test_loader:
-                    x = x.to(device_t)
-                    zs.append(model.encoder(x).mean.cpu())
-            z_all = torch.cat(zs, dim=0)
-
-            e_row = []
-            g_row = []
-            for p in range(num_pairs):
-                ia = int(pair_indices[p, 0])
-                ib = int(pair_indices[p, 1])
-                za = z_all[ia].to(device_t)
-                zb = z_all[ib].to(device_t)
-                eucl = torch.norm(za - zb).item()
-                e_row.append(eucl)
-
-                if num_decoders > 1:
-                    path = optimize_ensemble_geodesic(
-                        model,
-                        za,
-                        zb,
-                        num_interior,
-                        device_t,
-                        lr=args.geodesic_lr,
-                        steps=args.geodesic_steps,
-                        mc_samples=mc,
-                    )
-                else:
-                    path = optimize_geodesic(
-                        model,
-                        za,
-                        zb,
-                        num_interior,
-                        device_t,
-                        lr=args.geodesic_lr,
-                        steps=args.geodesic_steps,
-                    )
+                zs = []
                 with torch.no_grad():
-                    E = curve_energy_at_path(
-                        model,
-                        path,
-                        use_ensemble=(num_decoders > 1),
-                        mc_samples=mc,
-                    )
-                g_row.append(torch.sqrt(E + 1e-12).item())
+                    for x, _y in mnist_test_loader:
+                        x = x.to(device_t)
+                        zs.append(model.encoder(x).mean.cpu())
+                z_all = torch.cat(zs, dim=0)
 
-            eucl_dists.append(np.array(e_row, dtype=np.float64))
-            geo_dists.append(np.array(g_row, dtype=np.float64))
+                e_row = []
+                g_row = []
+                for p in range(num_pairs):
+                    ia = int(pair_indices[p, 0])
+                    ib = int(pair_indices[p, 1])
+                    za = z_all[ia].to(device_t)
+                    zb = z_all[ib].to(device_t)
+                    eucl = torch.norm(za - zb).item()
+                    e_row.append(eucl)
 
-        if len(eucl_dists) == 0:
-            print(f"warning: no models for D={D}, skipping CoV")
-            cov_eucl_mean.append(float("nan"))
-            cov_geo_mean.append(float("nan"))
-            continue
+                    if num_decoders > 1:
+                        path = optimize_ensemble_geodesic(
+                            model,
+                            za,
+                            zb,
+                            num_interior,
+                            device_t,
+                            lr=args.geodesic_lr,
+                            steps=args.geodesic_steps,
+                            mc_samples=mc,
+                        )
+                    else:
+                        path = optimize_geodesic(
+                            model,
+                            za,
+                            zb,
+                            num_interior,
+                            device_t,
+                            lr=args.geodesic_lr,
+                            steps=args.geodesic_steps,
+                        )
+                    with torch.no_grad():
+                        E = curve_energy_at_path(
+                            model,
+                            path,
+                            use_ensemble=(num_decoders > 1),
+                            mc_samples=mc,
+                        )
+                    g_row.append(torch.sqrt(E + 1e-12).item())
+                    pbar_pairs.update(1)
 
-        stack_e = np.stack(eucl_dists, axis=0)
-        stack_g = np.stack(geo_dists, axis=0)
-        cov_e = []
-        cov_g = []
-        for p in range(num_pairs):
-            cov_e.append(np.std(stack_e[:, p]) / (np.mean(stack_e[:, p]) + 1e-12))
-            cov_g.append(np.std(stack_g[:, p]) / (np.mean(stack_g[:, p]) + 1e-12))
-        cov_eucl_mean.append(float(np.mean(cov_e)))
-        cov_geo_mean.append(float(np.mean(cov_g)))
+                eucl_dists.append(np.array(e_row, dtype=np.float64))
+                geo_dists.append(np.array(g_row, dtype=np.float64))
+
+            stack_e = np.stack(eucl_dists, axis=0)
+            stack_g = np.stack(geo_dists, axis=0)
+            cov_e = []
+            cov_g = []
+            for p in range(num_pairs):
+                cov_e.append(np.std(stack_e[:, p]) / (np.mean(stack_e[:, p]) + 1e-12))
+                cov_g.append(np.std(stack_g[:, p]) / (np.mean(stack_g[:, p]) + 1e-12))
+            cov_eucl_mean.append(float(np.mean(cov_e)))
+            cov_geo_mean.append(float(np.mean(cov_g)))
 
     fig, ax = plt.subplots(figsize=(7, 4.5))
     ax.plot(
