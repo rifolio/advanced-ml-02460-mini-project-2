@@ -1,0 +1,12 @@
+{
+  "epochs_per_decoder": 150,
+  "latent_dim": 2,
+  "batch_size": 32,
+  "num_decoders": 1,
+  "rerun_index": 0,
+  "num_reruns": 10,
+  "training_seed": 0,
+  "experiment_folder": "experiment_extra_long",
+  "figure_prefix": "experiment_extra_long",
+  "trained_at_unix": 1774943595.9498878
+}
